@@ -34,12 +34,11 @@ function escapeInto(s, out) {
   else if (last < s.length) out.push(s.slice(last));
 }
 
+const ESC_NEEDED_RE = /[&<>"']/;
+
 /** `s` with the five HTML escapes applied (the string itself when clean). */
 function escapeHtml(s) {
-  if (
-    s.indexOf('&') === -1 && s.indexOf('<') === -1 && s.indexOf('>') === -1 &&
-    s.indexOf('"') === -1 && s.indexOf("'") === -1
-  ) return s;
+  if (!ESC_NEEDED_RE.test(s)) return s;
   const out = [];
   escapeInto(s, out);
   return out.join('');
@@ -268,17 +267,6 @@ function isSpaceCode(c) {
   return WS_TABLE[c] === 1;
 }
 
-/** How many whitespace-separated words `text` holds. */
-function countWords(text) {
-  let n = 0;
-  let inWord = false;
-  for (let i = 0; i < text.length; i++) {
-    if (WS_TABLE[text.charCodeAt(i)] === 1) inWord = false;
-    else if (!inWord) { inWord = true; n++; }
-  }
-  return n;
-}
-
 /** The first `what` at or after `from` (and before `hi`) not hidden by a backslash escape. */
 function findUnescaped(s, what, from, hi) {
   const wlen = what.length;
@@ -301,6 +289,21 @@ function findSingleStar(s, from, hi) {
   return -1;
 }
 
+/** Push s[lo, hi) onto `out` with the five HTML escapes applied. */
+function escapeRange(s, lo, hi, out) {
+  let last = lo;
+  for (let i = lo; i < hi; i++) {
+    const esc = ESC_BY_CODE[s.charCodeAt(i)];
+    if (esc !== undefined) {
+      if (i > last) out.push(s.slice(last, i));
+      out.push(esc);
+      last = i + 1;
+    }
+  }
+  if (last === lo) out.push(s.slice(lo, hi));
+  else if (last < hi) out.push(s.slice(last, hi));
+}
+
 const WS_RE = /\s/;
 
 /**
@@ -311,6 +314,10 @@ const WS_RE = /\s/;
 const SPECIAL_RE = /[\\`*\[&<>"']/g;
 
 function renderInline(s, lo, hi, link, out) {
+  // Fast path: no special character in the range means plain text.
+  SPECIAL_RE.lastIndex = lo;
+  const sm0 = SPECIAL_RE.exec(s);
+  if (sm0 === null || sm0.index >= hi) { if (hi > lo) out.push(s.slice(lo, hi)); return; }
   let i = lo;
   let plain = lo;
   const flush = (upto) => { if (upto > plain) out.push(s.slice(plain, upto)); };
@@ -345,7 +352,7 @@ function renderInline(s, lo, hi, link, out) {
       if (k !== -1 && k < hi && k > j + 1) {
         flush(j);
         out.push('<code>');
-        escapeInto(s.slice(j + 1, k), out);
+        escapeRange(s, j + 1, k, out);
         out.push('</code>');
         i = k + 1;
         plain = i;
@@ -525,13 +532,31 @@ function trimLine(line) {
 }
 
 function endsParagraph(line) {
-  return isBlank(line) || fenceLang(line) !== null || headingOf(line) !== null || isHr(line);
+  if (line.length === 0) return true;
+  const c0 = line.charCodeAt(0);
+  if (c0 === 32 || c0 === 9) return isBlank(line);
+  if (c0 === 96) return fenceLang(line) !== null;
+  if (c0 === 35) return headingOf(line) !== null;
+  if (c0 === 45 || c0 === 42) return isHr(line);
+  return false;
+}
+
+/** How many whitespace-separated words `line` (one line, no newline) holds. */
+function wordsIn(line) {
+  let n = 0;
+  let inWord = false;
+  for (let i = 0; i < line.length; i++) {
+    if (WS_TABLE[line.charCodeAt(i)] === 1) inWord = false;
+    else if (!inWord) { inWord = true; n++; }
+  }
+  return n;
 }
 
 /**
  * Render a Markdown body in one fused pass: blocks are recognised and
- * rendered in the same walk, so no token objects are ever built.
- * Returns { html, toc, excerpt }.
+ * rendered in the same walk, so no token objects are ever built. Word
+ * counting rides along: every line is consumed once, so summing per-line
+ * counts equals counting the whole body. Returns { html, toc, excerpt, words }.
  */
 function renderMarkdown(src, link) {
   const lines = src.split('\n');
@@ -539,40 +564,55 @@ function renderMarkdown(src, link) {
   const toc = [];
   const ids = new Set();
   let excerpt = null;
+  let words = 0;
   let i = 0;
   const n = lines.length;
   while (i < n) {
     const line = lines[i];
     if (isBlank(line)) { i++; continue; }
-    const lang = fenceLang(line);
+    const c0 = line.charCodeAt(0);
+    const lang = c0 === 96 ? fenceLang(line) : null;
     if (lang !== null) {
+      words += wordsIn(line);
       i++;
       const parts = ['<pre><code'];
       if (lang !== '') parts.push(' class="language-' + escapeHtml(lang) + '"');
       parts.push('>');
       while (i < n && !isFenceClose(lines[i])) {
+        words += wordsIn(lines[i]);
         escapeInto(lines[i], parts);
         parts.push('\n');
         i++;
       }
+      if (i < n) words += wordsIn(lines[i]);
       i++;
       parts.push('</code></pre>\n');
       out.push(parts.join(''));
       continue;
     }
-    const heading = headingOf(line);
+    const heading = c0 === 35 ? headingOf(line) : null;
     if (heading !== null) {
+      words += wordsIn(line);
       const id = uniqueSlug(slugify(heading.text), ids);
-      const html = inlineString(heading.text, link);
-      out.push('<h' + heading.depth + ' id="' + id + '">' + html + '</h' + heading.depth + '>\n');
-      if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
+      if (heading.depth === 2 || heading.depth === 3) {
+        const html = inlineString(heading.text, link);
+        out.push('<h' + heading.depth + ' id="' + id + '">' + html + '</h' + heading.depth + '>\n');
+        toc.push({ level: heading.depth, id, html });
+      } else {
+        out.push('<h' + heading.depth + ' id="' + id + '">');
+        renderInline(heading.text, 0, heading.text.length, link, out);
+        out.push('</h' + heading.depth + '>\n');
+      }
       i++;
       continue;
     }
-    if (isHr(line)) { out.push('<hr>\n'); i++; continue; }
-    if (line.charCodeAt(0) === 62) { // blockquote
+    if (c0 === 45 || c0 === 42) {
+      if (isHr(line)) { words += wordsIn(line); out.push('<hr>\n'); i++; continue; }
+    }
+    if (c0 === 62) { // blockquote
       const kept = [];
       while (i < n && lines[i].charCodeAt(0) === 62) {
+        words += wordsIn(lines[i]);
         let q = lines[i].slice(1);
         if (q.charCodeAt(0) === 32) q = q.slice(1);
         q = trimLine(q);
@@ -580,11 +620,16 @@ function renderMarkdown(src, link) {
         i++;
       }
       if (kept.length === 0) out.push('<blockquote>\n</blockquote>\n');
-      else out.push('<blockquote>\n<p>' + inlineString(kept.join('\n'), link) + '</p>\n</blockquote>\n');
+      else {
+        const joined = kept.length === 1 ? kept[0] : kept.join('\n');
+        out.push('<blockquote>\n<p>');
+        renderInline(joined, 0, joined.length, link, out);
+        out.push('</p>\n</blockquote>\n');
+      }
       continue;
     }
-    const bText = bulletText(line);
-    const oText = bText === null ? orderedText(line) : null;
+    const bText = (c0 === 45 || c0 === 42) ? bulletText(line) : null;
+    const oText = bText === null && c0 >= 48 && c0 <= 57 ? orderedText(line) : null;
     if (bText !== null || oText !== null) {
       const ordered = oText !== null;
       const items = [];
@@ -592,9 +637,11 @@ function renderMarkdown(src, link) {
         const cur = lines[i];
         const t = ordered ? orderedText(cur) : bulletText(cur);
         if (t !== null) {
+          words += wordsIn(cur);
           items.push([trimLine(ordered ? t.text : t)]);
           i++;
         } else if (isContinued(cur)) {
+          words += wordsIn(cur);
           items[items.length - 1].push(trimLine(cur));
           i++;
         } else break;
@@ -604,7 +651,8 @@ function renderMarkdown(src, link) {
       else parts.push('<ul>\n');
       for (const partsOfItem of items) {
         parts.push('<li>');
-        parts.push(inlineString(partsOfItem.join('\n'), link));
+        const joined = partsOfItem.length === 1 ? partsOfItem[0] : partsOfItem.join('\n');
+        renderInline(joined, 0, joined.length, link, parts);
         parts.push('</li>\n');
       }
       parts.push(ordered ? '</ol>\n' : '</ul>\n');
@@ -612,13 +660,20 @@ function renderMarkdown(src, link) {
       continue;
     }
     const body = [trimLine(line)];
+    words += wordsIn(line);
     i++;
-    while (i < n && !endsParagraph(lines[i])) { body.push(trimLine(lines[i])); i++; }
-    const html = inlineString(body.join('\n'), link);
-    if (excerpt === null) excerpt = html;
-    out.push('<p>' + html + '</p>\n');
+    while (i < n && !endsParagraph(lines[i])) { words += wordsIn(lines[i]); body.push(trimLine(lines[i])); i++; }
+    const joined = body.length === 1 ? body[0] : body.join('\n');
+    if (excerpt === null) {
+      excerpt = inlineString(joined, link);
+      out.push('<p>' + excerpt + '</p>\n');
+    } else {
+      out.push('<p>');
+      renderInline(joined, 0, joined.length, link, out);
+      out.push('</p>\n');
+    }
   }
-  return { html: out.join(''), toc, excerpt: excerpt === null ? '' : excerpt };
+  return { html: out.join(''), toc, excerpt: excerpt === null ? '' : excerpt, words };
 }
 
 // ---------------------------------------------------------------- templates
@@ -777,11 +832,19 @@ function renderNodes(nodes, scope, templates, depth, out) {
         const xs = lookup(scope, n.path);
         if (!Array.isArray(xs)) break;
         const len = xs.length;
+        // One loop record and one child scope for the whole loop: rendering
+        // is synchronous, so no iteration's bindings outlive its render.
+        const loop = { index: 1, first: true, last: len === 1, length: len };
+        const child = { vars: null, parent: scope };
         for (let k = 0; k < len; k++) {
+          loop.index = k + 1;
+          loop.first = k === 0;
+          loop.last = k === len - 1;
           const vars = {};
           vars[n.name] = xs[k];
-          vars.loop = { index: k + 1, first: k === 0, last: k === len - 1, length: len };
-          renderNodes(n.body, { vars, parent: scope }, templates, depth, out);
+          vars.loop = loop;
+          child.vars = vars;
+          renderNodes(n.body, child, templates, depth, out);
         }
         break;
       }
@@ -858,19 +921,31 @@ function dirOf(path) {
   return at === -1 ? '' : path.slice(0, at);
 }
 
+const resolveCache = new Map();
+
 /** A link path resolved against a source directory, or null if it climbs out. */
 function resolvePath(dir, rel) {
+  let byDir = resolveCache.get(dir);
+  if (byDir === undefined) {
+    byDir = new Map();
+    resolveCache.set(dir, byDir);
+  } else {
+    const hit = byDir.get(rel);
+    if (hit !== undefined) return hit;
+  }
   const parts = dir === '' ? [] : dir.split('/');
   const segs = rel.split('/');
   for (let i = 0; i < segs.length; i++) {
     const seg = segs[i];
     if (seg === '' || seg === '.') continue;
     if (seg === '..') {
-      if (parts.length === 0) return null;
+      if (parts.length === 0) { byDir.set(rel, null); return null; }
       parts.pop();
     } else parts.push(seg);
   }
-  return parts.join('/');
+  const out = parts.join('/');
+  byDir.set(rel, out);
+  return out;
 }
 
 /** Whether `target` opens with a URI scheme, checked by hand. */
@@ -956,9 +1031,10 @@ export function run(input) {
   const linkCache = new Map();
   for (const s of kept) {
     const dir = dirOf(s.path);
+    let byDir = linkCache.get(dir);
+    if (byDir === undefined) { byDir = new Map(); linkCache.set(dir, byDir); }
     const link = (target) => {
-      const key = dir + '\n' + target;
-      const hit = linkCache.get(key);
+      const hit = byDir.get(target);
       if (hit !== undefined) {
         if (hit.broken) broken.add('broken-link ' + s.path + ' -> ' + target);
         return hit.href;
@@ -977,7 +1053,7 @@ export function run(input) {
         else if (path !== null && staticPaths.has(path)) href = base + '/' + path + frag;
         else { href = target; isBroken = true; }
       }
-      linkCache.set(key, { href, broken: isBroken });
+      byDir.set(target, { href, broken: isBroken });
       if (isBroken) broken.add('broken-link ' + s.path + ' -> ' + target);
       return href;
     };
@@ -985,6 +1061,7 @@ export function run(input) {
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
+    s.words = md.words;
   }
 
   // Collections: posts newest first, equal dates by slug.
@@ -1044,7 +1121,7 @@ export function run(input) {
     date_long: s.data.date === undefined || s.data.date === null ? '' : longDate(s.data.date),
     summary: s.data.summary !== undefined && s.data.summary !== null ? s.data.summary : '',
     excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(countWords(s.body) / 200)),
+    reading_minutes: Math.max(1, Math.ceil(s.words / 200)),
     tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
   });
   const cards = new Map();
